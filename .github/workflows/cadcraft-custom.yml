@@ -1,8 +1,9 @@
-
 name: CADCraft - Cruz infinita
 
 on:
   workflow_dispatch:
+  push:
+    branches: [main]
 
 permissions:
   contents: read
