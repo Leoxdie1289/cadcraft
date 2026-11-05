@@ -6,70 +6,68 @@ on:
   push:
     branches: [main]
   schedule:
-    # Diariamente, 06:23 no horario de Fortaleza
     - cron: "23 9 * * *"
 
 permissions:
-  contents: write
-
-concurrency:
-  group: cadcraft-atualizacao
-  cancel-in-progress: false
+  contents: read
+  actions: read
 
 jobs:
   compilar:
     runs-on: windows-latest
 
     steps:
-      - name: Baixar repositorio
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Verificar e importar atualizacoes
-        id: sync
+      - name: Verificar ultima versao oficial
+        id: release
         shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          $tag = gh api repos/storytold/cadcraft/releases/latest --jq .tag_name
 
-          git remote add upstream https://github.com/storytold/cadcraft.git
-          git fetch upstream main --no-tags
-
-          git merge-base --is-ancestor upstream/main HEAD
-          $status = $LASTEXITCODE
-
-          if ($status -eq 0) {
-            Write-Host "CADCraft ja esta atualizado."
-            "changed=false" >> $env:GITHUB_OUTPUT
+          if ($LASTEXITCODE -ne 0 -or -not $tag) {
+            throw "Nao foi possivel consultar a ultima versao."
           }
-          elseif ($status -eq 1) {
-            Write-Host "Nova atualizacao encontrada."
 
-            git merge --no-edit upstream/main
+          $tag = $tag.Trim()
+          "tag=$tag" >> $env:GITHUB_OUTPUT
+          Write-Host "Versao oficial encontrada: $tag"
+
+          $build = $true
+
+          if ($env:GITHUB_EVENT_NAME -eq "schedule") {
+            $names = @(gh api "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '.artifacts[] | select(.expired == false) | .name')
+
             if ($LASTEXITCODE -ne 0) {
-              throw "Conflito ao sincronizar o fork."
+              throw "Falha ao consultar os Artifacts."
             }
 
-            git push origin HEAD:main
-            if ($LASTEXITCODE -ne 0) {
-              throw "Falha ao atualizar o fork."
-            }
+            $prefix = "CADCraft-Cruz-Infinita-$tag-run"
 
-            "changed=true" >> $env:GITHUB_OUTPUT
+            if (@($names | Where-Object { $_.StartsWith($prefix) }).Count -gt 0) {
+              Write-Host "Esta versao ja foi compilada."
+              $build = $false
+            }
           }
-          else {
-            throw "Falha na verificacao de atualizacoes."
-          }
+
+          "build=$($build.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
+
+      - name: Baixar ultima versao oficial
+        if: steps.release.outputs.build == 'true'
+        uses: actions/checkout@v6
+        with:
+          repository: storytold/cadcraft
+          ref: ${{ steps.release.outputs.tag }}
+          persist-credentials: false
 
       - name: Preparar Rust
-        if: steps.sync.outputs.changed == 'true' || github.event_name != 'schedule'
+        if: steps.release.outputs.build == 'true'
         run: |
           rustup update stable
           rustup default stable
 
-      - name: Aplicar modificacao da cruz infinita
-        if: steps.sync.outputs.changed == 'true' || github.event_name != 'schedule'
+      - name: Aplicar cruz infinita
+        if: steps.release.outputs.build == 'true'
         shell: pwsh
         run: |
           $path = "crates/ui-egui/src/canvas/cursor.rs"
@@ -94,17 +92,17 @@ jobs:
             $path, $source.Replace($old, $new)
           )
 
-          Write-Host "Cruz infinita aplicada."
+          Write-Host "Modificacao aplicada com sucesso."
 
-      - name: Compilar CADCraft atualizado
-        if: steps.sync.outputs.changed == 'true' || github.event_name != 'schedule'
+      - name: Compilar CADCraft
+        if: steps.release.outputs.build == 'true'
         run: cargo build --release --locked -p cadcraft
 
       - name: Disponibilizar executavel
-        if: steps.sync.outputs.changed == 'true' || github.event_name != 'schedule'
-        uses: actions/upload-artifact@v4
+        if: steps.release.outputs.build == 'true'
+        uses: actions/upload-artifact@v6
         with:
-          name: CADCraft-Cruz-Infinita-Windows-x64
+          name: CADCraft-Cruz-Infinita-${{ steps.release.outputs.tag }}-run${{ github.run_number }}
           path: target/release/cadcraft.exe
           if-no-files-found: error
           retention-days: 90
