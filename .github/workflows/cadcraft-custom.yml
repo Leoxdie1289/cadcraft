@@ -1,30 +1,79 @@
+
 name: CADCraft - Cruz infinita
 
 on:
   workflow_dispatch:
   push:
     branches: [main]
+  schedule:
+    # Diariamente, 06:23 no horario de Fortaleza
+    - cron: "23 9 * * *"
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: cadcraft-atualizacao
+  cancel-in-progress: false
 
 jobs:
   compilar:
     runs-on: windows-latest
 
     steps:
-      - name: Baixar codigo
+      - name: Baixar repositorio
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verificar e importar atualizacoes
+        id: sync
+        shell: pwsh
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git remote add upstream https://github.com/storytold/cadcraft.git
+          git fetch upstream main --no-tags
+
+          git merge-base --is-ancestor upstream/main HEAD
+          $status = $LASTEXITCODE
+
+          if ($status -eq 0) {
+            Write-Host "CADCraft ja esta atualizado."
+            "changed=false" >> $env:GITHUB_OUTPUT
+          }
+          elseif ($status -eq 1) {
+            Write-Host "Nova atualizacao encontrada."
+
+            git merge --no-edit upstream/main
+            if ($LASTEXITCODE -ne 0) {
+              throw "Conflito ao sincronizar o fork."
+            }
+
+            git push origin HEAD:main
+            if ($LASTEXITCODE -ne 0) {
+              throw "Falha ao atualizar o fork."
+            }
+
+            "changed=true" >> $env:GITHUB_OUTPUT
+          }
+          else {
+            throw "Falha na verificacao de atualizacoes."
+          }
 
       - name: Preparar Rust
+        if: steps.sync.outputs.changed == 'true' || github.event_name != 'schedule'
         run: |
           rustup update stable
           rustup default stable
 
-      - name: Modificar cursor
+      - name: Aplicar modificacao da cruz infinita
+        if: steps.sync.outputs.changed == 'true' || github.event_name != 'schedule'
         shell: pwsh
         run: |
           $path = "crates/ui-egui/src/canvas/cursor.rs"
+
           $old = '    let len = (rect.height() * app.session.settings.cursorsize as f32 / 100.0).max(12.0);'
 
           $new = @(
@@ -38,19 +87,24 @@ jobs:
           $source = [System.IO.File]::ReadAllText($path)
 
           if (-not $source.Contains($old)) {
-            throw "Trecho original nao encontrado."
+            throw "Codigo do cursor mudou. Revisao necessaria."
           }
 
           [System.IO.File]::WriteAllText(
             $path, $source.Replace($old, $new)
           )
 
-      - name: Compilar CADCraft
+          Write-Host "Cruz infinita aplicada."
+
+      - name: Compilar CADCraft atualizado
+        if: steps.sync.outputs.changed == 'true' || github.event_name != 'schedule'
         run: cargo build --release --locked -p cadcraft
 
       - name: Disponibilizar executavel
+        if: steps.sync.outputs.changed == 'true' || github.event_name != 'schedule'
         uses: actions/upload-artifact@v4
         with:
           name: CADCraft-Cruz-Infinita-Windows-x64
           path: target/release/cadcraft.exe
           if-no-files-found: error
+          retention-days: 90
