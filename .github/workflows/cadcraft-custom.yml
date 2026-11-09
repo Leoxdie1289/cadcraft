@@ -6,7 +6,7 @@ on:
   push:
     branches: [main]
   schedule:
-    # Verifica atualizacoes a cada 6 horas (UTC)
+    # Verificar atualizacoes a cada 6 horas
     - cron: "23 */6 * * *"
 
 permissions:
@@ -18,51 +18,78 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  atualizar:
+  atualizar-e-compilar:
     runs-on: windows-latest
     timeout-minutes: 120
 
     steps:
+      # 1. BAIXAR MEU FORK
       - name: Baixar meu Fork
         uses: actions/checkout@v6
         with:
           fetch-depth: 0
+          persist-credentials: true
 
-      - name: Sincronizar com CADCraft original
+      # 2. SINCRONIZAR COM O CADCRAFT ORIGINAL
+      - name: Atualizar Fork automaticamente
         shell: pwsh
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
           git remote add upstream https://github.com/storytold/cadcraft.git
-          git fetch upstream main --no-tags
+          git fetch --no-tags upstream main
 
-          git merge-base --is-ancestor upstream/main HEAD
+          if ($LASTEXITCODE -ne 0) {
+            throw "Erro ao buscar atualizacoes."
+          }
+
+          Write-Host "Comparando arquivos com CADCraft original..."
+
+          # Copiar codigo atualizado sem tocar nos workflows
+          # Nao importar historico de commits do upstream
+          git restore --source=upstream/main --staged --worktree -- . ':(exclude).github/workflows'
+
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao atualizar arquivos."
+          }
+
+          # Garantir que nenhum workflow sera enviado
+          $wf = @(git diff --cached --name-only -- .github/workflows)
+
+          if ($LASTEXITCODE -ne 0 -or $wf.Count -gt 0) {
+            throw "Alteracao proibida em workflows."
+          }
+
+          git diff --cached --quiet
           $status = $LASTEXITCODE
 
           if ($status -eq 0) {
-            Write-Host "Fork ja esta atualizado."
+            Write-Host "Fork ja possui os arquivos atualizados."
           }
           elseif ($status -eq 1) {
-            Write-Host "Atualizacao encontrada. Sincronizando..."
+            Write-Host "Atualizacoes encontradas."
 
-            git merge --no-edit upstream/main
+            git commit -m "Atualizar codigo do CADCraft original"
+
             if ($LASTEXITCODE -ne 0) {
-              throw "Conflito ao sincronizar o Fork."
+              throw "Erro ao registrar atualizacao."
             }
 
             git push origin HEAD:main
+
             if ($LASTEXITCODE -ne 0) {
-              throw "Falha ao enviar atualizacao ao Fork."
+              throw "Erro ao enviar atualizacao ao Fork."
             }
 
-            Write-Host "Fork atualizado com sucesso."
+            Write-Host "Fork atualizado com sucesso!"
           }
           else {
-            throw "Erro ao comparar repositorios."
+            throw "Erro ao verificar diferencas."
           }
 
-      - name: Verificar ultima versao oficial
+      # 3. IDENTIFICAR ULTIMA VERSAO OFICIAL
+      - name: Verificar ultima release
         id: release
         shell: pwsh
         env:
@@ -71,17 +98,23 @@ jobs:
           $tag = gh api repos/storytold/cadcraft/releases/latest --jq .tag_name
 
           if ($LASTEXITCODE -ne 0 -or -not $tag) {
-            throw "Falha ao consultar ultima release."
+            throw "Nao foi possivel consultar ultima release."
           }
 
           $tag = $tag.Trim()
           "tag=$tag" >> $env:GITHUB_OUTPUT
+
           Write-Host "Ultima versao oficial: $tag"
 
           $build = $true
 
+          # Em execucoes agendadas, evitar recompilar
+          # uma release com Artifact ainda disponivel
           if ($env:GITHUB_EVENT_NAME -eq "schedule") {
-            $names = @(gh api --paginate "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '.artifacts[] | select(.expired == false) | .name')
+
+            $names = @(
+              gh api --paginate "repos/$env:GITHUB_REPOSITORY/actions/artifacts?per_page=100" --jq '.artifacts[] | select(.expired == false) | .name'
+            )
 
             if ($LASTEXITCODE -ne 0) {
               throw "Erro ao consultar Artifacts."
@@ -89,33 +122,54 @@ jobs:
 
             $prefix = "CADCraft-Cruz-Infinita-$tag-run"
 
-            if (@($names | Where-Object { $_.StartsWith($prefix) }).Count -gt 0) {
-              Write-Host "Esta versao ja foi compilada."
+            $existing = @(
+              $names | Where-Object {
+                $_.StartsWith($prefix)
+              }
+            )
+
+            if ($existing.Count -gt 0) {
+              Write-Host "Esta release ja foi compilada."
               $build = $false
             }
           }
 
           "build=$($build.ToString().ToLowerInvariant())" >> $env:GITHUB_OUTPUT
 
-      - name: Baixar versao oficial mais recente
+      # 4. BAIXAR ULTIMA RELEASE OFICIAL
+      - name: Baixar CADCraft oficial atualizado
         if: steps.release.outputs.build == 'true'
         uses: actions/checkout@v6
         with:
           repository: storytold/cadcraft
           ref: ${{ steps.release.outputs.tag }}
+          path: codigo-oficial
           persist-credentials: false
 
+      # 5. PREPARAR COMPILADOR RUST
       - name: Preparar Rust
         if: steps.release.outputs.build == 'true'
+        shell: pwsh
         run: |
           rustup update stable
-          rustup default stable
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao atualizar Rust."
+          }
 
+          rustup default stable
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha ao configurar Rust."
+          }
+
+          rustc --version
+          cargo --version
+
+      # 6. MODIFICAR A CRUZ DO CURSOR
       - name: Aplicar cruz infinita
         if: steps.release.outputs.build == 'true'
         shell: pwsh
         run: |
-          $path = "crates/ui-egui/src/canvas/cursor.rs"
+          $path = "codigo-oficial/crates/ui-egui/src/canvas/cursor.rs"
 
           $old = '    let len = (rect.height() * app.session.settings.cursorsize as f32 / 100.0).max(12.0);'
 
@@ -127,27 +181,44 @@ jobs:
             '    };'
           ) -join "`n"
 
+          if (-not (Test-Path $path)) {
+            throw "Arquivo do cursor nao encontrado."
+          }
+
           $source = [System.IO.File]::ReadAllText($path)
 
           if (-not $source.Contains($old)) {
             throw "Codigo do cursor mudou. Revisao necessaria."
           }
 
+          $modified = $source.Replace($old, $new)
+
           [System.IO.File]::WriteAllText(
-            $path, $source.Replace($old, $new)
+            $path, $modified
           )
 
-          Write-Host "Cruz infinita aplicada."
+          Write-Host "Cruz infinita aplicada com sucesso!"
 
-      - name: Compilar CADCraft
+      # 7. COMPILAR EXECUTAVEL WINDOWS
+      - name: Compilar CADCraft para Windows
         if: steps.release.outputs.build == 'true'
-        run: cargo build --release --locked -p cadcraft
+        working-directory: codigo-oficial
+        shell: pwsh
+        run: |
+          cargo build --release --locked -p cadcraft
 
-      - name: Disponibilizar executavel
+          if ($LASTEXITCODE -ne 0) {
+            throw "Falha na compilacao do CADCraft."
+          }
+
+          Write-Host "Compilacao concluida!"
+
+      # 8. DISPONIBILIZAR EXECUTAVEL
+      - name: Publicar CADCraft modificado
         if: steps.release.outputs.build == 'true'
         uses: actions/upload-artifact@v6
         with:
           name: CADCraft-Cruz-Infinita-${{ steps.release.outputs.tag }}-run${{ github.run_number }}
-          path: target/release/cadcraft.exe
+          path: codigo-oficial/target/release/cadcraft.exe
           if-no-files-found: error
           retention-days: 90
